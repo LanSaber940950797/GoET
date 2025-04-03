@@ -1,23 +1,39 @@
 package entity
 
-import "sync/atomic"
+import (
+	"GoET/core/idgenerater"
+	"GoET/core/objectpool"
+	"errors"
+	"fmt"
+	"reflect"
+)
 
-var (
-	idGener         uint64
-	instanceIdGener uint64
+type EntityStatus byte
+
+const (
+	None       EntityStatus = 0
+	IsFromPool EntityStatus = 1 << iota
+	IsRegister
+	IsComponent
+	IsCreated
+	IsNew
 )
 
 type Entity struct {
-	Id         uint64
-	InstanceId uint64
-	Children   map[uint64]*Entity
-	Components map[uint64]*Entity
+	id         int64
+	instanceId int64
+	status     EntityStatus
+	parent     *Entity
+	iScene     IScene
+	children   map[int64]*Entity
+	components map[reflect.Type]*Entity
 }
 
-func CreateEntity[T Entity](isFromPool bool) *T {
+func createEntity[T Entity](isFromPool bool) *T {
 	var t *T
 	if isFromPool {
 		//todo 内存池
+		return objectpool.Fetch[T]()
 	} else {
 		t = &T{}
 	}
@@ -25,41 +41,136 @@ func CreateEntity[T Entity](isFromPool bool) *T {
 	return t
 }
 
-func AddChild[T Entity](self *Entity, isFromPool bool) *T {
-	t := CreateEntity[T](isFromPool)
-	self.AddChild(any(t).(*Entity))
-	return t
+func (e *Entity) GetParent() *Entity {
+	return e.parent
 }
 
-func AddChildWithId[T Entity](self *Entity, id uint64, isFromPool bool) *T {
-	t := CreateEntity[T](isFromPool)
-	any(t).(*Entity).Id = atomic.AddUint64(&idGener, 1)
-	self.AddChild(any(t).(*Entity))
-	return t
+func (e *Entity) SetParent(parent *Entity) error {
+	if parent == nil {
+		return errors.New("cannot set parent to nil")
+	}
+	if parent == e {
+		return errors.New("cannot set parent to self")
+	}
+	if parent.iScene == nil {
+		return errors.New("cannot set parent because parent domain is nil")
+	}
+
+	if e.parent != nil {
+		if e.parent == parent {
+			fmt.Println("重复设置了Parent")
+			return nil
+		}
+		e.parent.RemoveFromChildren(e)
+	}
+
+	e.parent = parent
+	e.SetIsComponent(false)
+	e.parent.addToChildren(e)
+
+	if scene, ok := interface{}(e).(IScene); ok {
+		scene.SetFiber(e.parent.iScene.Fiber())
+		e.SetScene(scene)
+	} else {
+		e.SetScene(e.parent.iScene)
+	}
+
+	return nil
 }
 
-func AddComponent[T Entity](self *Entity, isFromPool bool) *T {
-	t := CreateEntity[T](isFromPool)
-	self.AddComponent(any(t).(*Entity))
-	return t
+func (e *Entity) Scene() IScene {
+	return e.iScene
 }
 
-func (e *Entity) AddChild(entity *Entity) {
-	e.Children[entity.Id] = entity
+func (e *Entity) SetScene(scene IScene) {
+	if scene == nil {
+		panic("scene is nil")
+	}
+
+	if e.iScene == scene {
+		return
+	}
+
+	preScene := e.iScene
+	e.iScene = scene
+	if preScene == nil {
+		if e.instanceId == 0 {
+			e.instanceId = idgenerater.GenerateInstanceId()
+		}
+		e.SetIsRegister(true)
+	}
+
+	if e.children != nil {
+		for _, child := range e.children {
+			child.SetScene(scene)
+		}
+	}
+
+	if e.components != nil {
+		for _, component := range e.components {
+			component.SetScene(scene)
+		}
+	}
+
+	if !e.IsCreated() {
+		e.SetIsCreated(true)
+	}
 }
 
-func (e *Entity) RemoveChild(entity *Entity) {
-	e.RemoveChildById(entity.Id)
+func (e *Entity) IsDisposed() bool {
+	return e.instanceId == 0
 }
 
-func (e *Entity) RemoveChildById(id uint64) {
-	delete(e.Children, id)
+func (e *Entity) Dispose() {
+	if e.IsDisposed() {
+		return
+	}
+
+	e.SetIsRegister(false)
+	e.instanceId = 0
+
+	// 清理Children
+	if e.children != nil {
+		for _, child := range e.children {
+			child.Dispose()
+		}
+		//e.children = nil
+	}
+
+	// 清理Component
+	if e.components != nil {
+		for _, component := range e.components {
+			component.Dispose()
+		}
+		e.components = nil
+	}
+
+	// 触发Destroy事件
+	if _, ok := interface{}(e).(IDestroy); ok {
+		EntitySystemMgr.Destroy(e)
+	}
+
+	e.iScene = nil
+
+	if e.parent != nil && !e.parent.IsDisposed() {
+		if e.IsComponent() {
+			e.parent.RemoveComponent(e)
+		} else {
+			e.parent.RemoveFromChildren(e)
+		}
+	}
+
+	e.parent = nil
+	isFromPool := e.IsFromPool()
+	e.status = 0
+	e.SetIsFromPool(isFromPool)
+	objectpool.Release(e)
 }
 
-func (e *Entity) AddComponent(entity *Entity) {
-	e.Children[entity.Id] = entity
+func (e *Entity) Parent() *Entity {
+	return e.parent
 }
 
-func (e *Entity) RemoveComponent(entity *Entity) {
-	delete(e.Components, entity.Id)
+func GetParent[T Entity](e *Entity) *T {
+	return any(e.parent).(*T)
 }
